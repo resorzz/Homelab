@@ -1,166 +1,109 @@
-# 🧠 Homelab: Infraestructura self‑hosted de 3 nodos
+# Arquitectura de Infraestructura y HomeLab (Clúster Híbrido Multi-Nodo)
 
-## Por qué monté este homelab
-
-Monté este homelab para dejar de depender de Google Photos, Netflix y otros servicios de suscripción, y para tener un entorno real donde aprender redes, Linux y administración de sistemas. Todo empezó cuando un manager me dejó llevarme un mini PC a casa para trastear sin presión; desde ahí he ido evolucionando hacia un clúster de 3 nodos donde alojo mis fotos, documentos, medios, contraseñas y un servidor de Minecraft para amigos.
+## ¿Qué es esto?
+Infraestructura auto-gestionada de 3 nodos orientada a la soberanía de datos, resiliencia operativa y práctica de arquitectura de sistemas (Alta Disponibilidad, Copias de Seguridad, Infraestructura como Código y Redes Privadas). El sistema combina cómputo de aplicaciones mediante contenedores con un almacenamiento central en ZFS y réplicas automáticas fuera de sitio (offsite DR).
 
 ---
 
-## 🌐 Topología general y HA DNS
+## Topología de Red y Arquitectura
 
-```mermaid
-graph TD
-    subgraph "LAN 192.168.1.x"
-        N1[Node 1: Compute <br> IP: .10]
-        N3[Node 3: NAS + Minecraft <br> IP: .30]
-        VIP((VIP DNS: 192.168.1.12))
+- **Nodo 1 (Aplicaciones):** Ejecuta los contenedores y el tráfico de descargas aislado por VPN (Mullvad).
+- **Nodo 3 (NAS Central):** Guarda los datos en ZFS y comparte las carpetas con el Nodo 1 por NFS.
+- **Alta Disponibilidad (DNS):** Una IP virtual compartida (192.168.1.12) con Keepalived conmuta el DNS automáticamente entre el Nodo 1 y el Nodo 3 si uno cae.
+- **Red Privada (Tailscale):** Conecta de forma segura los nodos locales con el **Nodo 2 (Offsite en Cadaqués)** para enviar las copias de seguridad fuera de casa.
 
-        N1 -.->|MASTER 150| VIP
-        N3 -.->|BACKUP 100| VIP
-        N3 ==>|NFS exports| N1
-    end
+## Especificaciones de Hardware y Nodos
 
-    subgraph "Offsite (Cadaqués)"
-        N2[Node 2: Backup offsite <br> Tailscale only]
-    end
+| Nodo | Hardware | Memoria RAM | Discos y Almacenamiento | Sistema Operativo | Función Principal |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Nodo 1** | HP Elite Slice G2 (Intel i5-7500T) | 32 GB DDR4 | 1 TB NVMe | Debian 13 | Servidor de aplicaciones Docker y procesamiento de alertas |
+| **Nodo 2** | Lenovo ThinkCentre M600 Tiny | 4 GB DDR3 | 1 TB HDD (ZFS) | Debian 13 | Destino remoto de copias de seguridad (ZFS Receive, ARC limitado a 1GB) |
+| **Nodo 3** | AOOSTAR WTR PRO (AMD Ryzen 7 5825U) | 48 GB DDR4 | 2x NVMe M.2 500GB + 2x SSD 1TB + 2x HDD 2TB CMR | Debian 13 | NAS principal, almacenamiento ZFS y puerta de enlace de seguridad |
 
-    subgraph "Overlay"
-        TS[Tailscale mesh]
-        MV[Mullvad VPN]
+---
 
-        N1 <--> TS
-        N2 <--> TS
-        N3 <--> TS
+## Redes y Alta Disponibilidad (HA)
 
-        N1 -->|Gluetun| MV
-        N3 ==>|ZFS replication| N2
-    end
+### DNS Redundante con Keepalived (VRRP)
+
+Alta disponibilidad en la resolución DNS local mediante el protocolo VRRP en el sistema operativo host (Keepalived).
+
+- **VIP compartida:** `192.168.1.12` entre Nodo 1 (MASTER, prioridad 150) y Nodo 3 (BACKUP, prioridad 100).
+- **Comprobación de estado:** Un script en BASH (`check_dns.sh`) comprueba el servicio DNS (AdGuard Home) en el puerto 53. Si falla en el nodo activo, reduce la prioridad VRRP para migrar la IP virtual al otro nodo al instante.
+- **Sincronización:** Replicación automática de reglas y registros DNS entre ambos nodos con `adguardhome-sync` cada 5 minutos.
+
+### Seguridad Perimetral y Redes Privadas
+
+- **Red Malla Privada:** Conexión remota segura entre todos los nodos y dispositivos mediante Tailscale (basado en WireGuard) usando certificados HTTPS y MagicDNS.
+- **Túnel de Salida Aislado:** El tráfico de descargas en el Nodo 1 se fuerza a salir cifrado mediante un contenedor de Gluetun conectado a Mullvad VPN (nodo Suiza), incluyendo cortafuegos automático (kill-switch) si cae la VPN.
+- **Mínima Exposición Externa:** Cierre estricto de puertos en el router. Solo hay un puerto redirigido para un servicio específico (servidor de Minecraft en Nodo 3). Toda la administración se realiza exclusivamente por la red local o vía Tailscale.
+
+---
+
+## Seguridad y Protección de Servidores
+
+Protección en capas aplicada directamente sobre el cortafuegos del sistema operativo:
+
+```text
+[ Tráfico Entrante WAN ]
+       │
+       ▼
+ [ Cortafuegos UFW (Nodo 3) ] ──> [ Motor CrowdSec (Logs) ]
+       │                                  │
+       ▼                                  ▼
+ [ IP Permitida ]               [ IP en Lista Negra ]
+       │                                  │
+       ▼                                  ▼
+ [ Conexión a Contenedor ]      [ Bloqueo Kernel (nftables) ]
 ```
 
-En la red local uso una VIP (`192.168.1.12`) gestionada con **Keepalived** para tener DNS en alta disponibilidad: Node 1 actúa como MASTER y Node 3 como BACKUP. Tengo un script sencillo que comprueba AdGuard en el puerto 53 y, si falla en el nodo activo, fuerza el failover al otro.
+### Aislamiento con UFW
+Regla por defecto de denegar todo el tráfico entrante en el Nodo 3:
+- Permite acceso completo desde la red local (`192.168.1.0/24`).
+- Permite acceso SSH únicamente desde el rango de la red privada Tailscale (`100.64.0.0/10`).
+- Permite la entrada al puerto expuesto para el servidor del juego.
 
-Todos los nodos están unidos por **Tailscale** (para acceso remoto seguro), y el stack de descargas en Node 1 sale por **Gluetun + Mullvad** para no exponer la IP real del hogar.
-
----
-
-## 🖥️ Nodos de hardware
-
-| Rol | Hardware | RAM | Almacenamiento | Sistema |
-| :--- | :--- | :--- | :--- | :--- |
-| Node 1 – Compute | HP Elite Slice G2 (i5‑7500T) | 32GB | 1TB NVMe | Debian 13 |
-| Node 2 – Backup offsite | Lenovo ThinkCentre M600 Tiny | 4GB | 1TB HDD (ZFS) | Debian 13 |
-| Node 3 – NAS + Game server | AOOSTAR WTR PRO (Ryzen 7 5825U) | 48GB | 4x SATA, 2x NVMe | Debian 13 |
-
-Node 1 se centra en compute y orquestación Docker.  
-Node 3 es mi NAS principal y servidor de juegos.  
-Node 2 está en otra ubicación física, conectado solo por Tailscale, y se dedica a recibir copias de seguridad.
+### Detección y Filtrado Activo
+- **Análisis de Registros con CrowdSec:** Motor de CrowdSec analizando los registros del sistema en tiempo real para detectar intentos de fuerza bruta o escaneos.
+- **Bloqueo a Nivel de Kernel:** El plugin (bouncer) inyecta las IPs bloqueadas directamente en las tablas de nftables. Esto descarta las conexiones maliciosas a nivel de sistema antes de que consuman recursos en las aplicaciones.
 
 ---
 
-## 🎬 Servicios principales (lo que uso en el día a día)
+## Almacenamiento y Copias de Seguridad (Estrategia 3-2-1)
 
-Los servicios los orquesto con Dockge en stacks separados, pero lo importante es qué hacen:
+El almacenamiento central está configurado en el Nodo 3 utilizando ZFS, lo que evita la corrupción silenciosa de datos mediante comprobaciones de integridad (checksums).
 
-- **Jellyfin** – Es básicamente mi “Netflix/Prime Video” personal: streaming de pelis y series desde el NAS, con transcodificación por hardware (QSV) cuando hace falta.
-- **Immich** – reemplaza Google Photos. Todas mis fotos y vídeos van a Immich sobre ZFS, con snapshots y réplicas. Tengo acceso desde el móvil y puedo buscar por personas, fechas, etc.
-- **Vaultwarden** – gestor de contraseñas self‑hosted, accesible por Tailscale y protegido con 2FA.
-- **AdGuard Home (x2)** – DNS y bloqueo de anuncios a nivel de red. Una instancia en Node 1 y otra en Node 3, coordinadas con Keepalived para alta disponibilidad.
-- **Paperless‑ngx** – gestor documental para PDFs. Combino OneDrive + Syncthing + Paperless: OneDrive guarda los documentos, Syncthing los sincroniza al NAS y Paperless hace OCR y los indexa.
-- **Obsidian LiveSync** – sincronización cifrada extremo a extremo de mis notas.
-- **n8n** – motor de automatización que uso para alertas de hardware, notificaciones y tareas periódicas.
-- **Navidrome / Deemix** – biblioteca musical y streaming, con descarga automatizada de música.
+### Estructura de Pools ZFS
 
-Además de esto, tengo otros servicios auxiliares (Scrutiny para SMART, dashboards, etc.), pero lo esencial es que todo lo importante (fotos, docs, contraseñas, media) vive aquí.
+- **`fast_pool` (Mirror de SSDs 1TB):** Almacenamiento rápido y redundante para bases de datos (PostgreSQL), gestión de documentos (Paperless-ngx) y fotos (Immich).
+- **`media_pool` (Discos HDD CMR):** Almacenamiento para archivos multimedia, compartido por NFSv4 al Nodo 1 (montado con `systemd.automount` en `/etc/fstab` para no bloquear el sistema si el NAS no responde).
+- **`cold_backup` (Disco HDD Secundario):** Destino local para copias frías de respaldo.
+- **`minepool` (NVMe Dedicado):** Pool aislado con cuota de disco asignada para evitar que un servidor de aplicaciones llene el espacio del resto del sistema.
 
----
+### Sistema de Copias de Seguridad
 
-## 🗄️ Almacenamiento: ZFS y regla 3‑2‑1
+El flujo de trabajo sigue la regla 3-2-1 (3 copias, 2 medios distintos, 1 fuera de casa):
 
-Toda la parte de almacenamiento vive en **Node 3**, usando **ZFS**. ZFS me da checksums de integridad, snapshots y compresión automática, lo que me permite detectar y evitar corrupción silenciosa y mantener versiones históricas de datasets.
-
-Principales pools:
-
-- `fast_pool` (mirror SSD) – datasets críticos de Immich y Paperless.
-- `media_pool` (HDD) – contenido multimedia; lo exporto por NFS a Node 1.
-- `cold_backup` (HDD) – backups fríos locales de Immich.
-- `minepool` (NVMe dedicado) – pool ZFS aislado para el servidor de Minecraft.
-
-Para seguir la regla **3‑2‑1** (3 copias, 2 medios, 1 fuera de casa):
-
-- Tengo los datos en Node 3 (ZFS).
-- Hago snapshots automáticos (Sanoid).
-- Replico datasets importantes (por ejemplo, Immich) a **Node 2** usando Syncoid sobre Tailscale. Node 2 está fuera de mi casa, con ZFS también, así tengo copias offsite con verificación de integridad.
-- Si algo va mal en los pools (errores de ZFS o SMART), tengo scripts que envían alertas a Telegram vía n8n para enterarme rápido.
+- **Snapshots Locales (Sanoid):** Creación automática de instantáneas. En los datos críticos se guardan 10 snapshots diarios y 4 semanales de forma rotativa.
+- **Copia Remota Offsite (Syncoid sobre Tailscale):** Tarea programada cada madrugada (03:00 AM) que envía de forma incremental y cifrada los snapshots de ZFS desde el Nodo 3 hacia el Nodo 2 (ubicado en otra vivienda en Cadaqués) usando la VPN privada.
+- **Alertas de Salud del Hardware:** Un script revisa cada hora el estado de los discos (SMART) y la salud de los pools de ZFS (`zpool status`). Si detecta un fallo, envía un aviso mediante un webhook a n8n en el Nodo 1, que notifica inmediatamente por Telegram.
 
 ---
 
-## 🛡️ Seguridad actual (router, UFW, CrowdSec)
+## Gestión de Servicios y Aplicaciones
 
-No busco un setup paranoico, pero sí quiero tener lo mínimo serio montado.
+Los servicios están estructurados con Docker Compose y gestionados mediante Dockge.
 
-### Router
+### Gestión de Identidad y Contraseñas
+- **Vaultwarden:** Servidor de contraseñas (implementación ligera de Bitwarden). Funciona de forma totalmente aislada de internet, accesible solo por HTTPS desde la red privada de Tailscale y protegido con autenticación en dos factores (2FA).
 
-En el router solo tengo un port forwarding:
+### Procesamiento de Documentos
+Sistema para digitalizar y organizar documentos:
+- Sincronización de carpetas de documentos entre ordenadores y el NAS mediante Syncthing.
+- Procesamiento automático de los PDFs con Paperless-ngx (lectura OCR, etiquetado y búsqueda por contenido) guardando los datos en la base de datos sobre el pool rápido ZFS.
 
-- Puerto 25565 TCP/UDP hacia Node 3 para el servidor de Minecraft.
-
-No expongo otros servicios directamente a internet; el resto se ve solo desde la LAN o por Tailscale.
-
-### UFW en Node 3
-
-En Node 3 uso UFW con:
-
-- Incoming: **deny** por defecto.
-- Outgoing: **allow** por defecto.
-
-Y reglas explícitas para:
-
-- Permitir todo desde la LAN `192.168.1.0/24` (uso normal de casa).
-- Permitir SSH solo desde la red Tailscale `100.64.0.0/10`.
-- Permitir el puerto 25565 TCP/UDP (Minecraft) para conexiones externas.
-
-Con esto:
-
-- Minecraft sigue accesible desde fuera.
-- La administración del nodo (SSH) va solo por LAN o Tailscale.
-- Cualquier servicio nuevo que exponga puertos queda bloqueado hasta que yo decida abrirlo.
-
-### CrowdSec
-
-Tengo CrowdSec instalado en Node 3 analizando logs (por ejemplo SSH). Cuando detecta comportamientos sospechosos, añade las IPs a listas negras en el firewall. Yo sigo accediendo normal a mis servicios, pero las direcciones que CrowdSec marca como maliciosas dejan de poder conectar.
-
----
-
-## 📝 Documentos y flujo con OneDrive
-
-Toda mi documentación personal la guardo en OneDrive. En el homelab:
-
-- Uso **Syncthing** para sincronizar automáticamente esos documentos desde OneDrive a un directorio del NAS.
-- **Paperless‑ngx** vigila ese directorio, hace OCR y etiqueta los PDFs.
-
-Así puedo buscar documentos por contenido (palabras dentro del PDF) y no por nombre de archivo, y tengo mis papeles centralizados y respaldados en ZFS, con snapshots y replicación.
-
----
-
-## 🎮 Servidor de Minecraft
-
-En Node 3 tengo un servidor de Minecraft para amigos:
-
-- Lo gestiono con **Crafty Controller** en Docker (panel web, backups, logs).
-- El mundo vive en `minepool/crafty` (ZFS sobre NVMe dedicado) con quota de 50GB para no competir con Immich y el resto.
-- A nivel de configuración del juego:
-  - Whitelist activa.
-  - `online-mode=true` para verificar cuentas oficiales.
-  - `prevent-proxy-connections=true` para complicar el uso de proxies.
-
-A nivel de red y seguridad:
-
-- Solo el puerto 25565 está expuesto en el router.
-- UFW controla qué puertos están abiertos en Node 3.
-- CrowdSec vigila los intentos sospechosos y manda IPs problemáticas al firewall.
-
-Inicialmente el ISP me tenía tras CGNAT y el port forwarding no funcionaba aunque estuviera bien hecho; lo solucioné pidiendo una IP pública exclusiva (no fija, pero enrutable). Una vez activa, el servidor quedó accesible desde un dominio propio en Cloudflare en modo DNS only.
-
----
-
-Uso este homelab como entorno de aprendizaje continuo y como forma de depender menos de servicios externos. Cada nueva pieza que añado intento integrarla siguiendo buenas prácticas de almacenamiento, red y seguridad.
+### Otros Servicios Almacenados
+- **Monitorización y Automatización:** n8n (Gestión de alertas) y Scrutiny (Salud de discos duros).
+- **Herramientas:** Obsidian LiveSync (Sincronización cifrada de notas) y Stirling-PDF.
+- **Servicios Multimedia:** Jellyfin (Transcodificación por hardware en la CPU), Navidrome y Deemix (Música), y el stack de descargas (*Arr) aislado tras la VPN Gluetun.
+- **Servidores de Juegos:** Servidor de Minecraft alojado en el almacenamiento NVMe aislado, protegido con lista blanca, verificación de cuentas oficiales y bloqueo de IPs anómalas con CrowdSec.
